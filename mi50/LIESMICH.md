@@ -1,7 +1,7 @@
 # Strata auf 2× MI50 32 GB: alle Verbesserungen
 
 Dieses Repo ist Strata 0.2.8 (Upstream-Commit `870aedd9`, github.com/Niko1221/Strata) plus alle Verbesserungen für
-gfx906 aus der Optimierung am 30.10.2026. Der Branch heißt `mi50-gfx906`, `main` steht unverändert auf Upstream.
+gfx906 aus der Optimierung am 30.10.2026. Der Branch heißt `mi50-gfx906`, `main` steht unverändert auf Upstream. Die Übersicht steht im [README](../README.md).
 
 ## Ergebnis
 
