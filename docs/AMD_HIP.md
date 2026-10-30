@@ -596,6 +596,10 @@ In the config: `"args": [ ..., "--pipeline-windows", "2", "--trim-stage-weights"
 | `--pipeline-windows 2` | 66.9 tok/s (+36%) | 353 tok/s |
 | plus `--trim-stage-weights` | +2% | 371 tok/s |
 
+**2x MI50 32 GB, decode tuning:** [AMD_MI50.md](AMD_MI50.md) lists the opt-in gfx906 kernel switches with their
+measurements: Qwen3.8 Flash Next IQ3_M at a 9,927-token prompt goes from 51.5 to 82.3 tok/s, and no
+kernel change alters the output.
+
 Not done on gfx906: setup detection and automatic build, Windows, images (`--vision`), MI60 and Radeon VII (same ISA, not run),
 a single-card run. Other measurements are under [History](#history--older-measurements).
 
