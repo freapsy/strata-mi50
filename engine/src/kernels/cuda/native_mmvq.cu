@@ -644,6 +644,19 @@ __global__ void native_q4_k_mmvq_kernel(const Q4KBlock* __restrict__ w,
 
 // Exact pinned vec_dot_q6_K_q8_1: keep signed per-16-element scales,
 // signed-byte subtraction, DP4A order, and the float accumulation sequence.
+// gfx906: __vsubss4 is an emulated i8x4 saturating subtract (~10 VALU ops); for Q6_K's codes (bytes 0..63) nothing
+// saturates, so (x + 0x60) ^ 0x80 per byte (no carry: 0x60..0x9f) gives the same int8 bytes in 2 ops (CUDA's P2 trick).
+// FAST=false keeps the old form: q6k_wave4_kernel at 1 column is memory-bound and measured 3-4 % slower with the short one
+template<bool FAST = true>
+__device__ __forceinline__ int q6_sub32(int x) {
+#if defined(__HIPCC__)
+    if constexpr (!FAST) return __vsubss4(x, 0x20202020);
+    return (x + 0x60606060) ^ int(0x80808080u);
+#else
+    return __vsubss4(x, 0x20202020);
+#endif
+}
+template<bool FAST = true>
 __device__ __forceinline__ float q6_q8_dot_impl(int vl, int vh, const int* __restrict__ u,
                                               const int8_t* __restrict__ scales,
                                               float d, const float* __restrict__ d8) {
@@ -653,7 +666,7 @@ __device__ __forceinline__ float q6_q8_dot_impl(int vl, int vh, const int* __res
         const int sc = scales[4 * i];
         const int vil = (vl >> (4 * i)) & 0x0f0f0f0f;
         const int vih = ((vh >> (4 * i)) << 4) & 0x30303030;
-        const int vi = __vsubss4(vil | vih, 0x20202020);
+        const int vi = q6_sub32<FAST>(vil | vih);
 #if defined(__HIPCC__)   // gfx906: quarter-rate v_mul_lo_u32; |dp| <= 16384 and |sc| < 128, so the 24-bit product is exact
         sumf += d8[i] * __mul24(STRATA_DP4A(vi, u[i], 0), sc);
 #else
@@ -1426,7 +1439,7 @@ template<> struct B6X<Q6KTraits> {
         for (int i = 0; i < 2; ++i) {
             const int vil = (w.vl >> (4 * i)) & 0x0f0f0f0f;
             const int vih = ((w.vh >> (4 * i)) << 4) & 0x30303030;
-            const int vi = __vsubss4(vil | vih, 0x20202020);
+            const int vi = q6_sub32(vil | vih);
             sumf += x.d8[i] * (STRATA_DP4A(vi, x.u[i], 0) * w.sc[i]);
         }
         return w.d * sumf;
@@ -2461,7 +2474,7 @@ __global__ void q6k_wave4_kernel(const Q6KBlock* __restrict__ w, const Q81Block*
             for (int k = 0; k < 4; ++k) {
                 const int u[2] = {reinterpret_cast<const int*>(xb[0].qs)[iqs0 % 8 + k],
                                   reinterpret_cast<const int*>(xb[2].qs)[iqs0 % 8 + k]};
-                p[c][k] += q6_q8_dot_impl(vl[k], vh[k], u, b->scales + scale_offset, d, d8);
+                p[c][k] += q6_q8_dot_impl<(NCOLS > 1)>(vl[k], vh[k], u, b->scales + scale_offset, d, d8);
             }
         }
     }
