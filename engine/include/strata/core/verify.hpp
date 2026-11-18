@@ -448,6 +448,21 @@ public:
     bool pcie_balance_on() const { return bal_ != nullptr && m_bal_ != nullptr; }
 
     double ms_wait = 0, ms_pool = 0, ms_host = 0, ms_commit = 0;
+    /// STRATA_STAGE_SPAN=1 (diagnostic): the last pipelined window's launch latency (the launch call to the graph's
+    /// first kernel, host clock) and the graph's own time (its first to its last kernel, GPU clock), in ms
+    bool span_last(double& launch_ms, double& gpu_ms) const {
+        if (span_h_ == nullptr || span_seen_ms_ == 0) return false;
+        launch_ms = span_seen_ms_ - span_pre_ms_;
+        gpu_ms = (double) (span_h_[4] - span_h_[0]) / 1e6;
+        return true;
+    }
+    /// the last window's per-layer times into the sums of class `cls` (0 fresh, 1 speculative); span_report() prints them
+    void span_accumulate(int cls);
+    std::string span_report();
+    /// its segments in us: the stage's entry (inputs, hand-off in), its first layer, its other layers, its exit
+    void span_seg(int seg[4]) const {
+        for (int i = 0; i < 4; ++i) seg[i] = span_h_ != nullptr ? (int) ((span_h_[i + 1] - span_h_[i]) / 1000) : 0;
+    }
     int64_t windows = 0;
     /// STRATA_VERIFY_PROFILE=1 - GPU stage times of the windows since the last call (ms per
     /// window), as one line; empty when off.
@@ -632,6 +647,11 @@ private:
     // #649: STRATA_VERIFY_TRACE=1 - a host event ring (trace_ev) and GPU breadcrumbs: the profiler's stamp points,
     // per layer and token group, written to mapped memory (null when the trace is off)
     void trace_ev(const char* what, int64_t step, int64_t layer, int64_t aux) const;
+    unsigned long long* span_h_ = nullptr;   // STRATA_STAGE_SPAN: GPU ns at the graph's start, after its entry, its first layer, its last layer, its end (mapped)
+    unsigned long long* span_m_ = nullptr;
+    double span_pre_ms_ = 0, span_seen_ms_ = 0;
+    double span_lsum_[2][9][64] = {};   // [class][T][layer of the stage] ns
+    int64_t span_ln_[2][9] = {};
     unsigned long long* trace_h_ = nullptr;
     unsigned long long* trace_m_ = nullptr;
     size_t trace_n_ = 0;

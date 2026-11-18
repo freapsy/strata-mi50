@@ -1142,6 +1142,10 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     }
     if (hflag_in_d_ != nullptr && herr_h_ == nullptr &&
         !mapped(64, (void**) &herr_h_, (void**) &herr_d_)) { err = "verify: hand-off error word allocation failed"; return false; }
+    if (env_on("STRATA_STAGE_SPAN") && span_h_ == nullptr && !mapped(72 * 8, (void**) &span_h_, (void**) &span_m_)) {
+        (void) cudaGetLastError();
+        span_h_ = span_m_ = nullptr;
+    }
     if (g_trace && trace_h_ == nullptr) {   // #649: the breadcrumbs, mapped so they read while the GPU hangs
         trace_n_ = (size_t) (g.n_layers + 1) * kProfPer * 2;
         if (!mapped(trace_n_ * 8, (void**) &trace_h_, (void**) &trace_m_)) {
@@ -2566,13 +2570,18 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         return true;
     };
 
+    if (span_m_ != nullptr && !batch_rec_) gpu_stamp(span_m_, 1, cs);
     for (int grp = 0; grp < G; ++grp)
         if (!pre(lb_, grp)) return false;
-    for (int64_t l = lb_; l < le_; ++l)
+    for (int64_t l = lb_; l < le_; ++l) {
         for (int grp = 0; grp < G; ++grp) {
             if (!post(l, grp)) return false;
             if (l + 1 < le_ && !pre(l + 1, grp)) return false;
         }
+        if (span_m_ != nullptr && !batch_rec_ && l == lb_) gpu_stamp(span_m_, 2, cs);
+        if (span_m_ != nullptr && !batch_rec_ && l - lb_ < 64) gpu_stamp(span_m_, 8 + (int) (l - lb_), cs);
+    }
+    if (span_m_ != nullptr && !batch_rec_) gpu_stamp(span_m_, 3, cs);
     if (le_ < g.n_layers) {   // a layer split's earlier stage: hand the residual on, no head
         float* hout = hand_out_ + (size_t) hrow0 * HB;
         if (hflag_out_d_ != nullptr && !batch_rec_) {   // the overlapped split: payload + the next stage's flag
@@ -2827,7 +2836,9 @@ bool Verifier::capture(int T, std::string& err) {
     prio_tails_.clear();
 #endif
     std::string rerr;
+    if (span_m_ != nullptr) strata::kernels::gpu_stamp(span_m_, 0, cs_);
     const bool ok = record_window(T, cs_, rerr);
+    if (span_m_ != nullptr) strata::kernels::gpu_stamp(span_m_, 4, cs_);
     cudaGraph_t graph = nullptr;
     const cudaError_t ce = cudaStreamEndCapture(cs_, &graph);
     if (!ok) {
@@ -5419,6 +5430,12 @@ bool Verifier::pl_launch(int T, const int32_t* tokens, int64_t pos0, std::string
     std::atomic_thread_fence(std::memory_order_seq_cst);
     trace_ev("WINDOW (pipelined)", -1, -1, pos0 * 16 + T);
     ms_host += ms_since(t0);
+    if (span_h_ != nullptr) {
+        std::memset(span_h_, 0, 72 * 8);
+        span_seen_ms_ = 0;
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        span_pre_ms_ = now_ms();
+    }
     strata::dispatch::Stats::get().graph_launch(T, ar_on() ? 0 : 1);
     const cudaError_t le = cudaGraphLaunch(exec_[sl][T], cs_);
     trace_ev("LAUNCHED", -1, -1, (int64_t) le);
@@ -5526,6 +5543,7 @@ int Verifier::service(PoolMultiFn pool, void* user, std::string& err) {
 
 bool Verifier::done(std::string& err) {
     if (!fl_active_ || fl_k_ < fl_total_) return false;
+    if (span_h_ != nullptr && span_seen_ms_ == 0 && *(const volatile unsigned long long*) span_h_ != 0) span_seen_ms_ = now_ms();
     const OnDevice on_device(device_);
     const cudaError_t q = cudaEventQuery(ev_done_);
     if (q == cudaErrorNotReady) {
@@ -5599,7 +5617,41 @@ bool Verifier::pl_commit_async(int n_keep, std::string& err) {
     return true;
 }
 
+void Verifier::span_accumulate(int cls) {
+    if (span_h_ == nullptr || fl_T_ < 1 || fl_T_ > 8) return;
+    const int n = (int) std::min<int64_t>(le_ - lb_, 64);
+    for (int k = 0; k < n; ++k)
+        span_lsum_[cls][fl_T_][k] += (double) (span_h_[8 + k] - (k == 0 ? span_h_[1] : span_h_[8 + k - 1]));
+    ++span_ln_[cls][fl_T_];
+}
+
+std::string Verifier::span_report() {
+    std::string out;
+    char b[64];
+    const int n = (int) std::min<int64_t>(le_ - lb_, 64);
+    for (int cls = 0; cls < 2; ++cls)
+        for (int T = 1; T <= 8; ++T) {
+            if (span_ln_[cls][T] == 0) continue;
+            std::snprintf(b, sizeof b, "%s T%d n=%lld us/layer:", cls == 0 ? "fresh" : "spec", T, (long long) span_ln_[cls][T]);
+            out += b;
+            for (int k = 0; k < n; ++k) {
+                std::snprintf(b, sizeof b, " %.0f", span_lsum_[cls][T][k] / 1e3 / (double) span_ln_[cls][T]);
+                out += b;
+            }
+            out += "\n";
+        }
+    std::memset(span_lsum_, 0, sizeof span_lsum_);
+    std::memset(span_ln_, 0, sizeof span_ln_);
+    return out;
+}
+
 void Verifier::absorb_stats(Verifier& o) {
+    for (int c = 0; c < 2; ++c)
+        for (int T = 0; T < 9; ++T) {
+            for (int k = 0; k < 64; ++k) { span_lsum_[c][T][k] += o.span_lsum_[c][T][k]; o.span_lsum_[c][T][k] = 0; }
+            span_ln_[c][T] += o.span_ln_[c][T];
+            o.span_ln_[c][T] = 0;
+        }
     ms_wait += o.ms_wait; ms_pool += o.ms_pool; ms_host += o.ms_host; ms_commit += o.ms_commit;
     windows += o.windows;
     o.ms_wait = o.ms_pool = o.ms_host = o.ms_commit = 0;

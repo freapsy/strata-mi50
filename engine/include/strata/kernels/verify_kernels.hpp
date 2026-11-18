@@ -104,6 +104,8 @@ void wait_flag_ge_stamped(const uint32_t* flag, uint32_t value, unsigned long lo
 void gpu_stamp(unsigned long long* buf, int i, void* stream);
 /// an empty one-thread kernel (a graph node that does nothing: STRATA_DUMMY_NODES measures what a node costs in a window)
 void gpu_noop(void* stream);
+/// One thread spinning for `ns` on `stream` (STRATA_KEEP_WARM): keeps the card's clock up, computes nothing.
+void warm_spin(unsigned long long ns, void* stream);
 /// dst[r][0, w) = src[r][0, w) for `rows` rows of source stride `src_w` floats (the query half of each q/gate head
 /// pair): the strided device-to-device cudaMemcpy2DAsync as a kernel, so the window's chain stays kernel to kernel.
 /// w and src_w multiples of 4 floats, both pointers 16-byte aligned.

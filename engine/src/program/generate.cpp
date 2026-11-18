@@ -12575,6 +12575,57 @@ int main(int argc, char** argv) {
                     stage_ver_p(st, par).set_always_publish(true);
                 }
         }
+        // STRATA_KEEP_WARM=<us> (opt-in; measured on 3x MI50, gfx906): while the pipelined decode runs, a stage whose
+        // stream has no window in flight spins one thread for <us> at a time on that same stream.  A stage's card
+        // idles between its windows; its clock governor drops sclk to the idle level within a millisecond and takes
+        // several of the next window to come back (first layer +0.7 ms, the others +12%), once per stage and window.
+        // On the stage's own stream and one piece at a time, so a window waits for at most one piece and nothing runs
+        // beside the spin: a spin on a stream of its own shares a hardware queue with some other stream and holds
+        // that back (3-20 tok/s), at a lower priority every window kernel preempts it (380 ms a stage), and more
+        // hardware queues (GPU_MAX_HW_QUEUES=24) cost a third of the decode by themselves.
+        const int pl_warm_us = [] {
+            const char* v = std::getenv("STRATA_KEEP_WARM");
+            return v != nullptr ? std::max(0, std::min(5000, std::atoi(v))) : 0;
+        }();
+        std::vector<cudaEvent_t> pl_warm_ev(pipe && pl_warm_us > 0 ? (size_t) n_stages : 0, nullptr);
+        std::vector<char> pl_warm_live(pl_warm_ev.size(), 0);
+        double pl_warm_next = 0.0;
+        for (size_t st = 0; st < pl_warm_ev.size(); ++st) {
+            const strata::core::OnDevice on(st == 0 ? stage_ver_p(0, 0).device() : stages[st - 1]->dev);
+            if (cudaEventCreateWithFlags(&pl_warm_ev[st], cudaEventDisableTiming) != cudaSuccess) {
+                std::fprintf(stderr, "strata serve: STRATA_KEEP_WARM: event creation failed\n");
+                return 1;
+            }
+        }
+        // STRATA_KEEP_WARM_MAX_C (default 80): a card whose hotspot reaches it stops spinning until it is 4 C cooler.
+        // A card held at its top clock while it idles runs 7-10 C hotter in a long answer (3x MI50, 8,000 tokens: 84 C
+        // against 74 C on the card with the weakest fan).  Read once a second from the card's hwmon (Linux amdgpu:
+        // temp2 is the hotspot); a card whose sensor cannot be read does not spin.
+        const int pl_warm_max_c = [] {
+            const char* v = std::getenv("STRATA_KEEP_WARM_MAX_C");
+            return v != nullptr ? std::atoi(v) : 80;
+        }();
+        std::vector<std::string> pl_warm_temp(pl_warm_ev.size());
+        std::vector<char> pl_warm_ok(pl_warm_ev.size(), 0);
+        double pl_warm_temp_next = 0.0;
+        for (size_t st = 0; st < pl_warm_ev.size(); ++st) {
+            int dev = 0;
+            char bus[32] = {};
+            if (st > 0) dev = stages[st - 1]->dev;
+            else if (cudaGetDevice(&dev) != cudaSuccess) continue;
+            if (hipDeviceGetPCIBusId(bus, (int) sizeof bus, dev) != hipSuccess) continue;
+            std::error_code ec;
+            for (const auto& e : std::filesystem::directory_iterator(std::string("/sys/bus/pci/devices/") + bus + "/hwmon", ec))
+                pl_warm_temp[st] = (e.path() / "temp2_input").string();
+        }
+        if (!pl_warm_ev.empty()) {
+            std::fprintf(stderr, "strata serve: STRATA_KEEP_WARM=%d: an idle stage's card spins in %d us pieces while "
+                                 "the pipelined decode runs, below %d C hotspot (STRATA_KEEP_WARM_MAX_C)\n", pl_warm_us,
+                         pl_warm_us, pl_warm_max_c);
+            for (size_t st = 0; st < pl_warm_temp.size(); ++st)
+                std::fprintf(stderr, "strata serve: STRATA_KEEP_WARM: stage %zu hotspot sensor %s\n", st,
+                             pl_warm_temp[st].empty() ? "not found (this card does not spin)" : pl_warm_temp[st].c_str());
+        }
         if (n_stages > 1) {
             // pipelined slot groups write their rows at hbase = group * rows-per-group, so with more than
             // kVerifyNarrowT slots in groups the hand-off holds one row per slot (otherwise kVerifyNarrowT, as before; a
@@ -20744,6 +20795,14 @@ int main(int argc, char** argv) {
                         w.fl = false;
                         if (++w.fr == pl_nf) w.finished = true;
                         tre("F0", w.seq, w.fr, w.spec);
+                        if (double sl, sg; v.span_last(sl, sg)) {
+                            int sg4[4];
+                            v.span_seg(sg4);
+                            v.span_accumulate(w.spec ? 1 : 0);
+                            tre("SP", w.seq, (int) (sl * 1000), (int) (sg * 1000));
+                            tre("SQ", w.seq, sg4[0], sg4[1]);
+                            tre("SR", w.seq, sg4[2], sg4[3]);
+                        }
                     }
                     return err.empty();
                 };
@@ -20923,7 +20982,36 @@ int main(int argc, char** argv) {
                     return v == nullptr || std::atoi(v) != 0;
                 }();
                 auto ms_now = [&]() { return std::chrono::duration<double, std::milli>(Clock::now() - pl_t0).count(); };
+                pl_warm_next = 0.0;
+                pl_warm_temp_next = 0.0;
                 while (true) {
+                    if (!pl_warm_ev.empty()) {   // STRATA_KEEP_WARM: one piece at a time on every idle stage's stream
+                        const double t = ms_now();
+                        if (t >= pl_warm_temp_next) {   // once a second: which cards are cool enough to spin
+                            pl_warm_temp_next = t + 1000.0;
+                            for (size_t st = 0; st < pl_warm_ok.size(); ++st) {
+                                long mc = -1;
+                                if (std::FILE* f = pl_warm_temp[st].empty() ? nullptr : std::fopen(pl_warm_temp[st].c_str(), "r")) {
+                                    if (std::fscanf(f, "%ld", &mc) != 1) mc = -1;
+                                    std::fclose(f);
+                                }
+                                if (mc < 0 || mc >= pl_warm_max_c * 1000L) pl_warm_ok[st] = 0;
+                                else if (mc <= (pl_warm_max_c - 4) * 1000L) pl_warm_ok[st] = 1;
+                            }
+                        }
+                        if (t >= pl_warm_next) {
+                            pl_warm_next = t + 0.02;
+                            for (int st = 0; st < n_stages; ++st) {
+                                if (!pl_warm_ok[(size_t) st] || stage_ver_p(st, 0).in_flight() || stage_ver_p(st, 1).in_flight()) continue;
+                                const strata::core::OnDevice on(stage_ver_p(st, 0).device());
+                                if (pl_warm_live[(size_t) st] && cudaEventQuery(pl_warm_ev[(size_t) st]) == cudaErrorNotReady) continue;
+                                strata::kernels::warm_spin((unsigned long long) pl_warm_us * 1000ull, pl_stream[(size_t) st]);
+                                (void) cudaEventRecord(pl_warm_ev[(size_t) st], pl_stream[(size_t) st]);
+                                (void) cudaStreamQuery(pl_stream[(size_t) st]);
+                                pl_warm_live[(size_t) st] = 1;
+                            }
+                        }
+                    }
                     g_pl_diag.iters.fetch_add(1, std::memory_order_relaxed);
                     g_pl_diag.a_seq.store(A.seq, std::memory_order_relaxed);
                     g_pl_diag.a_bits.store(pw_bits(A), std::memory_order_relaxed);
@@ -20960,6 +21048,14 @@ int main(int argc, char** argv) {
                             }
                             A.s1_done = true;
                             tre("F1", A.seq, A.T);
+                            if (double sl, sg; v.span_last(sl, sg)) {
+                                int sg4[4];
+                                v.span_seg(sg4);
+                                v.span_accumulate(A.spec ? 1 : 0);
+                                tre("SP", A.seq, (int) (sl * 1000), (int) (sg * 1000));
+                                tre("SQ", A.seq, sg4[0], sg4[1]);
+                                tre("SR", A.seq, sg4[2], sg4[3]);
+                            }
                         } else if (!err.empty()) return die(err);
                     }
                     if (drive.d.failed) return die(drive.d.fail ? drive.d.fail : "the expert pool failed");
@@ -21370,6 +21466,9 @@ int main(int argc, char** argv) {
                 }
                 // the odd windows' counters and GPU profiles into the verifiers that report them
                 for (int st = 0; st < n_stages; ++st) stage_ver_p(st, 0).absorb_stats(stage_ver_p(st, 1));
+                for (int st = 0; st < n_stages; ++st)
+                    if (const std::string sr = stage_ver_p(st, 0).span_report(); !sr.empty())
+                        std::fprintf(stderr, "strata stage span, stage %d:\n%s", st, sr.c_str());
                 if (!pl_adapt_ok) {
                     std::printf("ERR an adaptive refill failed\n");
                     return 1;

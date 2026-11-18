@@ -1314,6 +1314,20 @@ __global__ void wait_flag_ge_stamped_kernel(const volatile uint32_t* flag, uint3
 }
 }  // namespace
 
+namespace {
+// STRATA_KEEP_WARM: one thread spinning for `ns`, so the card's clock governor sees a busy GPU between a layer
+// split's windows.  It reads and writes nothing and ends by itself: nothing has to release it.
+__global__ void warm_spin_kernel(unsigned long long ns) {
+    const unsigned long long t0 = strata_now_ns();
+    while (strata_now_ns() - t0 < ns) strata_spin_pause();
+}
+}  // namespace
+
+void warm_spin(unsigned long long ns, void* stream) {
+    warm_spin_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(ns);
+    check("warm_spin");
+}
+
 void wait_handoff(const uint32_t* flag, uint32_t value, uint32_t* err, unsigned long long timeout_ns, void* stream) {
     wait_handoff_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(flag, value, err, timeout_ns);
     check("wait_handoff");
