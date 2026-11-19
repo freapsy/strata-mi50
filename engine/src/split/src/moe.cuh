@@ -305,7 +305,9 @@ __global__ void __launch_bounds__(DN_THREADS) k_moe_down(MoeW w, const Job* __re
     __shared__ block_q8_1 hq[MAXT][DN_MAXB];
     extern __shared__ float dn_part[];   // [the window's T][DN_THREADS] (launched with that much): MAXT's would halve the
     float(*part)[DN_THREADS] = reinterpret_cast<float(*)[DN_THREADS]>(dn_part);   // blocks an SM holds
+    __shared__ int8_t s_iq4[16];
     if (threadIdx.x == 0) jb = jobs[ji];
+    if constexpr (TA == T_IQ4_NL) { if (threadIdx.x < 16) s_iq4[threadIdx.x] = kvalues_iq4nl[threadIdx.x]; }
     __syncthreads();
     const int ffs = w.ncols, nb = ffs / DN_U, n = jb.n;
     if constexpr (PRE) {
@@ -332,7 +334,31 @@ __global__ void __launch_bounds__(DN_THREADS) k_moe_down(MoeW w, const Job* __re
     const bool live = r < rpb && row < w.nrows;
     if (live) {
         const char* wr = moe_expert(w, jb.w) + (size_t) row * w.row_a;
-        for (int j = 0; j < n; ++j) part[j][threadIdx.x] = unit_dot<TA, DN_U>(wr, u, hq[j]);
+        if constexpr (TA == T_IQ4_NL) {
+            const block_iq4_nl* bq4 = reinterpret_cast<const block_iq4_nl*>(wr) + u;
+            int gw[8];
+#pragma unroll
+            for (int l = 0; l < 4; ++l) {
+                const int aux_q4 = get_int_b2(bq4->qs, l);
+                const int2 v = get_int_from_table_16(aux_q4, s_iq4);
+                gw[l] = v.x;
+                gw[l + 4] = v.y;
+            }
+            const float d4 = __half2float(bq4->d);
+#pragma unroll 1
+            for (int j = 0; j < n; ++j) {
+                const int* q8 = reinterpret_cast<const int*>(hq[j][u].qs);
+                int sumi = 0;
+#pragma unroll
+                for (int l = 0; l < 4; ++l) {
+                    sumi = qd_dp4a(gw[l], q8[l], sumi);
+                    sumi = qd_dp4a(gw[l + 4], q8[l + 4], sumi);
+                }
+                part[j][threadIdx.x] = (d4 * __low2float(hq[j][u].ds)) * (float) sumi;
+            }
+        } else {
+            for (int j = 0; j < n; ++j) part[j][threadIdx.x] = unit_dot<TA, DN_U>(wr, u, hq[j]);
+        }
     }
     __syncthreads();
     for (int e = threadIdx.x; e < n * rpb; e += DN_THREADS) {
@@ -488,8 +514,99 @@ __global__ void __launch_bounds__(Q8S_THREADS) k_moe_gu_sd(MoeW w, const Job* __
     job_store<G, TT>(tmp, jb.n, live, row, jb.out, out, w.nrows);
 }
 
+#if FNX_HIP
+// Dedicated IQ3_S gate|up kernel (FNX_MOE_IQ3S=1 -> G=32 bit-identical, FNX_MOE_IQ3S=2 -> G=8 32 rows/block):
+// caches iq3s_grid[512] in 2 KB LDS and decodes each 32-weight sub-block ONCE across all jb.n tokens (#pragma unroll 1).
+template <int G, int TT>
+__global__ void __launch_bounds__(Q8S_THREADS, 4) k_moe_gu_iq3s(MoeW w, const Job* __restrict__ jobs, const int* __restrict__ njobs,
+                                                            const block_q8_1* __restrict__ y, float* __restrict__ out,
+                                                            const ShexpDown sd, int sd_rows) {
+    if ((int) blockIdx.y < sd_rows) {
+        shexp_down_blocks<TT>(sd, blockIdx.y * gridDim.x + blockIdx.x, sd_rows * gridDim.x);
+        return;
+    }
+    const int ji = blockIdx.y - sd_rows;
+    if (ji >= *njobs) return;
+    __shared__ Job jb;
+    __shared__ uint32_t s_grid[512];
+    if (threadIdx.x == 0) jb = jobs[ji];
+    s_grid[threadIdx.x] = iq3s_grid[threadIdx.x];
+    s_grid[threadIdx.x + 256] = iq3s_grid[threadIdx.x + 256];
+    __syncthreads();
+    const int row = blockIdx.x * (Q8S_THREADS / G) + threadIdx.x / G;
+    const bool live = row < w.nrows;
+    const int gl = threadIdx.x & (G - 1);
+    const int sub = gl & 7;
+    const int iqs = sub * 2;
+    const int bpi = G / 8;
+    const int bpr = w.ncols / 256;
+    const int y_stride = w.ncols / 32;
+    const int n = jb.n;
+    float tmp[TT] = {};
+    if (live) {
+        const block_iq3_s* wrow = reinterpret_cast<const block_iq3_s*>(moe_expert(w, jb.w) + (size_t) row * w.row_a);
+        for (int kbx = gl >> 3; kbx < bpr; kbx += bpi) {
+            const block_iq3_s* bq3 = wrow + kbx;
+            const int2 qs_packed = make_int2(get_int_b2(bq3->qs, iqs + 0), get_int_b2(bq3->qs, iqs + 1));
+            const uint8_t* qs = reinterpret_cast<const uint8_t*>(&qs_packed);
+            const int qh = bq3->qh[sub];
+            const int signs_packed_32 = get_int_b2(bq3->signs, sub);
+            const uint8_t* signs_packed_8 = reinterpret_cast<const uint8_t*>(&signs_packed_32);
+            int gw[8];
+#pragma unroll
+            for (int l0 = 0; l0 < 8; l0 += 2) {
+                const uint32_t g0 = s_grid[qs[l0 + 0] | ((qh << (8 - l0)) & 0x100)];
+                const uint32_t g1 = s_grid[qs[l0 + 1] | ((qh << (7 - l0)) & 0x100)];
+                const uint32_t sg = signs_packed_8[l0 / 2];
+                gw[l0 + 0] = iq_negate(g0, iq_sign_bytes(sg));
+                gw[l0 + 1] = iq_negate(g1, iq_sign_bytes(sg >> 4));
+            }
+            const int sc = 1 + 2 * ((bq3->scales[sub >> 1] >> ((iqs << 1) & 0x04)) & 0x0F);
+            const float d3 = __half2float(bq3->d);
+            const int kby = kbx * 8 + sub;
+#pragma unroll 1
+            for (int j = 0; j < n; ++j) {
+                const block_q8_1* by = y + (size_t) jb.y[j] * y_stride + kby;
+                int sumi = 0;
+#pragma unroll
+                for (int l = 0; l < 8; ++l) sumi = qd_dp4a(gw[l], get_int_b4(by->qs, l), sumi);
+                sumi *= sc;
+                tmp[j] += (d3 * __low2float(by->ds)) * (float) sumi;
+            }
+        }
+    }
+    job_store<G, TT>(tmp, n, live, row, jb.out, out, w.nrows);
+}
+#endif
+
 template <GgmlType TA>
 void gu_sd_launch(int T, const MoeW& w, const Job* jobs, const int* njobs, int njobs_max, const block_q8_1* y, float* out, cudaStream_t s, const ShexpDown& sd) {
+#if FNX_HIP
+    if constexpr (TA == T_IQ3_S) {
+        static const int iq_mode = (int) env_int("FNX_MOE_IQ3S", 0);
+        if (iq_mode == 1 || iq_mode == 2) {
+            const int G = iq_mode == 2 ? 8 : 32;
+            const int gx = (w.nrows + Q8S_THREADS / G - 1) / (Q8S_THREADS / G);
+            const int sd_blocks = (sd.rows + Q8S_THREADS / 32 - 1) / (Q8S_THREADS / 32);
+            const int sd_rows = sd.rows ? (sd_blocks + gx - 1) / gx : 0;
+            const dim3 grid(gx, njobs_max + sd_rows);
+            if (iq_mode == 2) {
+#define FNX_IQ2(t) case t: k_moe_gu_iq3s<8, t><<<grid, Q8S_THREADS, 0, s>>>(w, jobs, njobs, y, out, sd, sd_rows); break;
+                switch (T) { FNX_IQ2(1) FNX_IQ2(2) FNX_IQ2(3) FNX_IQ2(4) FNX_IQ2(5) FNX_IQ2(6) FNX_IQ2(7) FNX_IQ2(8)
+                             FNX_IQ2(9) FNX_IQ2(10) FNX_IQ2(11) FNX_IQ2(12) FNX_IQ2(13) FNX_IQ2(14) FNX_IQ2(15) FNX_IQ2(16)
+                             default: throw std::runtime_error("moe iq3s: T out of range"); }
+#undef FNX_IQ2
+            } else {
+#define FNX_IQ1(t) case t: k_moe_gu_iq3s<32, t><<<grid, Q8S_THREADS, 0, s>>>(w, jobs, njobs, y, out, sd, sd_rows); break;
+                switch (T) { FNX_IQ1(1) FNX_IQ1(2) FNX_IQ1(3) FNX_IQ1(4) FNX_IQ1(5) FNX_IQ1(6) FNX_IQ1(7) FNX_IQ1(8)
+                             FNX_IQ1(9) FNX_IQ1(10) FNX_IQ1(11) FNX_IQ1(12) FNX_IQ1(13) FNX_IQ1(14) FNX_IQ1(15) FNX_IQ1(16)
+                             default: throw std::runtime_error("moe iq3s: T out of range"); }
+#undef FNX_IQ1
+            }
+            return;
+        }
+    }
+#endif
     if (moe_g<TA>(w.ncols) != 32) throw std::runtime_error("moe gate|up: only 32 lanes a row are compiled (rows of N columns)");
     const int gx = (w.nrows + Q8S_THREADS / 32 - 1) / (Q8S_THREADS / 32), sd_blocks = (sd.rows + Q8S_THREADS / 32 - 1) / (Q8S_THREADS / 32);
     const int sd_rows = sd.rows ? (sd_blocks + gx - 1) / gx : 0;
@@ -512,7 +629,8 @@ void moe_launch(bool down, const MoeW& w, const Job* jobs, const int* njobs, int
         const int rpb = DN_THREADS / (w.ncols / DN_U), nh = njobs_max * (w.ncols / DN_U);   // njobs_max: the window's pairs
         const dim3 grid((w.nrows + rpb - 1) / rpb, njobs_max);
         const size_t smem = sizeof(float) * T * DN_THREADS;
-        if (T > 8) {
+        static const int h_thr = (int) env_int("FNX_MOE_H_T", 8);
+        if (T > h_thr) {
             if (njobs_max > MAXT * TOPK) throw std::runtime_error("moe_down: more pairs than g_moe_hq holds");
             k_moe_h<<<(nh + 7) / 8, 256, 0, s>>>((const float*) in, w.ncols, njobs_max);
             k_moe_down<TA, true><<<grid, DN_THREADS, smem, s>>>(w, jobs, njobs, (const float*) in, out);

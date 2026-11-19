@@ -129,6 +129,11 @@ void Gguf::convert_small_tensors() {
             ++converted_;
             continue;
         }
+        if (t.type == T_Q5_0 && kv.first.find("_exps.weight") != std::string::npos && kv.first.find("shexp") == std::string::npos) {
+            owned_.emplace_back();
+            conv::repack_q5_0_to_q5_1(t, owned_.back());
+            continue;
+        }
         const uint32_t want = conv::wanted_type(t.name);
         if (want == 0xFFFFFFFFu || want == t.type) continue;
         owned_.emplace_back();

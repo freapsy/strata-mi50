@@ -929,9 +929,11 @@ void Engine::attention(int T, CardBuf& b, const CardW& w, const LayerW& L, uint1
 // the FFN half: the hc read with the attention half's write folded in, the shared expert (in the router's and the
 // routed gate|up's launches on Q4_K layers, else on the second stream beside the router), the routing and the routed
 // experts, the weighted sum across the cards into b.bo_f
-void Engine::ffn_half(int T, int call, CardBuf& b, const CardW& w, const LayerW& L, float* R, const int* ctl) {
+void Engine::ffn_half(int T, int call, CardBuf& b, const CardW& w, const LayerW& L, float* R, const int* ctl, void* pev) {
+    cudaEvent_t* ev = static_cast<cudaEvent_t*>(pev);
     const int P = T * TOPK, ffs = w.ff1 - w.ff0;
     hc_read(R, b.bo_a, b.inj_a, L.hc_norm[1], L.hc_down[1], L.hc_up[1], L.hc_inj[1], m_.eps, b.mixed, b.inj_f, b.hcs, b.ring.err, T, b.st, b.xq);
+    if (ev) ck(cudaEventRecord(ev[0], b.st), "prof");
     // the shared expert (rows P + t of part): its gate|up in the router's launch and its swiglu and down in the routed
     // gate|up's (Q4_K experts), else on the second stream (a fork and a join cost ~5 us more than the launches' blocks)
     // (every expert type moe_gate_up handles; FNX_SH_FUSE=0 puts the non-Q4_K types back on the second stream)
@@ -967,21 +969,34 @@ void Engine::ffn_half(int T, int call, CardBuf& b, const CardW& w, const LayerW&
         // the planned experts copied into their slots before the MoE kernels read the layer's tables
         if (live) moe_cache(l, L.gu_e_stride, L.down_e_stride, w.ec, b.cache_list, b.st, plan_in_router ? nullptr : b.jobs_gu, b.njobs);
     }
+    if (ev) ck(cudaEventRecord(ev[1], b.st), "prof");
     if (sh_in) moe_gate_up(L.gu_e, L.gu_e_stride, b.jobs_gu, b.njobs, P, b.xq, b.gu, b.st, &L.sh_down.s, ffs, b.sh_gu, b.part + (size_t) P * N);
     else moe_gate_up(L.gu_e, L.gu_e_stride, b.jobs_gu, b.njobs, P, b.xq, b.gu, b.st);
+    if (ev) ck(cudaEventRecord(ev[2], b.st), "prof");
     moe_down(L.down_e, L.down_e_stride, b.jobs_dn, b.njobs, P, b.gu, b.part, b.st);
     if (!sh_in) ck(cudaStreamWaitEvent(b.st, b.join, 0), "join wait");
+    if (ev) ck(cudaEventRecord(ev[3], b.st), "prof");
     RingMoe m;
     m.part = b.part;
     m.topw = b.topw;
     m.logits = b.logits;
     ring_sum(b.ring, b.bo_f, T, (const unsigned*) (ctl + 1), call, b.st, m);
+    if (ev) ck(cudaEventRecord(ev[4], b.st), "prof");
 }
 
 // every card's work for one window of T rows, in stream order (captured into a graph unless dumping)
-void Engine::enqueue(int T, bool dumps) {
+void Engine::enqueue(int T, bool dumps, bool profile) {
     const float eps = m_.eps;
     int call = 0;
+    std::vector<cudaEvent_t> pevs;
+    if (profile) {
+        ck(cudaSetDevice(cb_[0]->dev), "prof dev");
+        pevs.resize((size_t) NL * 10 + 2);
+        for (auto& e : pevs) ck(cudaEventCreate(&e), "prof create");
+    }
+    auto prec = [&](int idx) {
+        if (profile) ck(cudaEventRecord(pevs[(size_t) idx], cb_[0]->st), "prof rec");
+    };
     auto each = [&](auto&& f) {
         for (int c = 0; c < NCARD; ++c) {
             ck(cudaSetDevice(cb_[c]->dev), "set");
@@ -1006,8 +1021,10 @@ void Engine::enqueue(int T, bool dumps) {
                 ple_post(b.R, b.ple_key, b.ple_val, w.ple_norm_key, w.ple_norm_query, w.ple_norm_conv, w.ple_conv,
                          b.ple_hist, b.ple_hsnap, T, eps, b.st, b.ple_key + (size_t) MAXT * D);
             }
+            if (c == 0) prec(l * 10 + 0);
             hc_read(b.R, apply ? b.bo_f : nullptr, b.inj_f, L.hc_norm[0], L.hc_down[0], L.hc_up[0], L.hc_inj[0], eps, b.mixed,
                     b.inj_a, b.hcs, b.ring.err, T, b.st, b.xq);
+            if (c == 0) prec(l * 10 + 1);
             if (!is_attn(l)) {
                 const int nv = w.nv(), ch = w.conv_ch();
                 // ab beside qkvz in one launch (a fork and a join: ~5 us more; compiled for 4096..8191 rows)
@@ -1027,14 +1044,17 @@ void Engine::enqueue(int T, bool dumps) {
             } else {
                 attention(T, b, w, L, b.kc[l], b.vc[l], b.ctl, b.qsa_ring[l], b.qsa_pooled[l], 128 + l);
             }
+            if (c == 0) prec(l * 10 + 2);
             ring_sum(b.ring, b.bo_a, T, (const unsigned*) (b.ctl + 1), call, b.st);
+            if (c == 0) prec(l * 10 + 3);
         });
         ++call;
         dd("hc_mixed", l, cb_[0]->mixed, N);
         dd("mixer_out", l, cb_[0]->bo_a, N);
         // ---- FFN half
-        each([&](int, CardBuf& b, const CardW& w) { ffn_half(T, call, b, w, w.L[l], b.R, b.ctl); });
+        each([&](int c, CardBuf& b, const CardW& w) { ffn_half(T, call, b, w, w.L[l], b.R, b.ctl, (profile && c == 0) ? (void*) &pevs[(size_t) l * 10 + 4] : nullptr); });
         df2_tap_window(l, T);
+        if (profile) { ck(cudaSetDevice(cb_[0]->dev), "prof dev"); prec(l * 10 + 9); }
         ++call;
         dd("ffn_mixed", l, cb_[0]->mixed, N);
         dd("ffn_out", l, cb_[0]->bo_f, N);
@@ -1043,10 +1063,35 @@ void Engine::enqueue(int T, bool dumps) {
     }
     // ---- head: the final mixer (no injection) with the last write folded in, then this card's vocabulary
     each([&](int c, CardBuf& b, const CardW& w) {
+        if (c == 0) prec(NL * 10 + 0);
         hc_read(b.R, b.bo_f, b.inj_f, w.head_norm, w.head_down, w.head_up, nullptr, eps, b.mixed, b.inj_a, b.hcs, b.ring.err, T, b.st, b.xq);
         dense(w.out, b.xq, b.head_logits, b, T);
         argmax(b.head_logits, w.v1 - w.v0, T, w.v0, b.best_v, b.best_i, b.am_keys, b.ring.err, b.st);
+        if (c == 0) prec(NL * 10 + 1);
     });
+    if (profile) {
+        ck(cudaSetDevice(cb_[0]->dev), "prof dev");
+        ck(cudaStreamSynchronize(cb_[0]->st), "prof sync");
+        double hc_a=0, gdn=0, attn=0, ring_a=0, hc_f=0, router=0, moe_gu=0, moe_dn=0, ring_f=0, df2t=0, head=0, tot=0;
+        auto dt = [&](int a, int b) { float ms=0; cudaEventElapsedTime(&ms, pevs[a], pevs[b]); return (double) ms; };
+        for (int l = 0; l < NL; ++l) {
+            int o = l * 10;
+            hc_a += dt(o+0, o+1);
+            if (is_attn(l)) attn += dt(o+1, o+2); else gdn += dt(o+1, o+2);
+            ring_a += dt(o+2, o+3);
+            hc_f += dt(o+3, o+4);
+            router += dt(o+4, o+5);
+            moe_gu += dt(o+5, o+6);
+            moe_dn += dt(o+6, o+7);
+            ring_f += dt(o+7, o+8);
+            df2t += dt(o+8, o+9);
+        }
+        head = dt(NL*10+0, NL*10+1);
+        tot = dt(0, NL*10+1);
+        std::fprintf(stderr, "prof_T=%d: tot=%.2fms | hc_a=%.2f gdn=%.2f attn=%.2f ring_a=%.2f | hc_f=%.2f router=%.2f moe_gu=%.2f moe_dn=%.2f ring_f=%.2f | df2t=%.2f head=%.2f\n",
+            T, tot, hc_a, gdn, attn, ring_a, hc_f, router, moe_gu, moe_dn, ring_f, df2t, head);
+        for (auto& e : pevs) cudaEventDestroy(e);
+    }
     dd("result_norm", -1, cb_[0]->mixed, N);
 }
 

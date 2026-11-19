@@ -621,6 +621,11 @@ Finish Session::generate(int max_new, const Sampling& s, const std::function<voi
     prompt_.clear();
     timing_ = nullptr;
     st.decode_ms = ms_since(t0);
+    if (std::getenv("FNX_STAGE_TIME")) {
+        std::fprintf(stderr, "prof_gen: gen=%d rounds=%d decode=%.1fms verify=%.1fms(gpu=%.1fms launch=%.1fms) draft=%.1fms(%d) commit=%.1fms other=%.1fms\n",
+            st.generated, st.rounds, st.decode_ms, st.verify_ms, st.verify_gpu_ms, st.launch_ms, st.draft_ms, st.draft_calls, st.commit_ms,
+            st.decode_ms - st.verify_ms - st.draft_ms - st.commit_ms);
+    }
     return fin;
 }
 

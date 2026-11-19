@@ -379,8 +379,245 @@ __global__ void __launch_bounds__(H_DT, 1) k_hc(HcArgs a) {
     } while (WALK && (vb += grid) < H_BLOCKS);
 }
 
+// Zero-barrier, zero-spill 3-kernel split for 60-CU gfx906 (FNX_HC_SPLIT=1): bit-identical to k_hc.
+// k_hc_down: 512 threads (H_RPG_D=64 x 8), 20*6=120 blocks = exact 2 blocks/CU on 60 CUs,
+// 2-half q loop + streaming inject branch keeps VGPRs <= 64 so ALL 120 blocks fit in 1 wave!
+constexpr int H_RPG_D = 64, H_RG_D = (H_ROWS + H_RPG_D - 1) / H_RPG_D, H_DT_D = H_RPG_D * H_TPRD, H_BLOCKS_D = H_NS * H_RG_D;
+static_assert(H_DT_D == 512 && H_SL == 512, "512-thread 1-wave k_hc_down");
+template <int T>
+__global__ void __launch_bounds__(H_DT_D, 2) k_hc_down(HcArgs a) {
+    __shared__ __align__(16) float xs[T][H_SL];
+    __shared__ __align__(16) int8_t xq[T][H_SL];
+    __shared__ float xd[T][H_SL / 32];
+    __shared__ float red[T][H_DT_D / 32];
+    const int t = threadIdx.x, warp = t >> 5, lane = t & 31;
+    const int vb = blockIdx.x;
+    const int s = vb / H_RG_D, grp = vb % H_RG_D;
+    const int col0 = s * H_SL, c = col0 / N, i0 = col0 - c * N;
+    {
+        float r[T];
+        const float wn = a.w_norm[col0 + t];
+#pragma unroll
+        for (int k = 0; k < T; ++k) r[k] = rprime(a, k, c, i0 + t);
+#pragma unroll
+        for (int k = 0; k < T; ++k) xs[k][t] = r[k] * wn;
+        if (grp == 0) {
+#pragma unroll
+            for (int k = 0; k < T; ++k) {
+                const float v = wsum(r[k] * r[k]);
+                if (lane == 0) red[k][warp] = v;
+            }
+        }
+    }
+    __syncthreads();
+    if (grp == 0 && t < T) {
+        float v = 0.f;
+        for (int w = 0; w < H_DT_D / 32; ++w) v += red[t][w];
+        a.ssp[(size_t) t * H_NS + s] = v;
+    }
+    for (int q = warp; q < T * (H_SL / 32); q += H_DT_D / 32) {
+        const int k = q / (H_SL / 32), blk = q % (H_SL / 32);
+        q8_block(xs[k][blk * 32 + lane], &xq[k][blk * 32], &xd[k][blk]);
+    }
+    __syncthreads();
+    {
+        constexpr int NQ = H_SL / 8 / H_TPRD;
+        const int j = t % H_TPRD, row = grp * H_RPG_D + t / H_TPRD;
+        const int nrows = a.w_inj ? H_ROWS : LR;
+        const bool live = row < nrows;
+        const int rr = live ? row : 0;
+        if (rr < LR) {
+            const uint2* w2 = reinterpret_cast<const uint2*>(a.w_down.q + (size_t) rr * D + col0);
+            const uint16_t* wd = a.w_down.d + ((size_t) rr * D + col0) / 32;
+            constexpr int HQ = NQ / 2;
+            {
+                uint2 u[HQ];
+                float sc[HQ];
+#pragma unroll
+                for (int q = 0; q < HQ; ++q) {
+                    u[q] = __ldg(w2 + q * H_TPRD + j);
+                    sc[q] = f16(__ldg(wd + (q * H_TPRD + j) / 4));
+                }
+#pragma unroll 1
+                for (int k = 0; k < T; ++k) {
+                    float acc = 0.f;
+#pragma unroll
+                    for (int q = 0; q < HQ; ++q) {
+                        const int ch = q * H_TPRD + j;
+                        acc = fmaf(sc[q] * xd[k][ch / 4], (float) dot8i(u[q], *reinterpret_cast<const int2*>(&xq[k][ch * 8])), acc);
+                    }
+                    for (int o = 1; o < H_TPRD; o <<= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
+                    if (live && j == 0) a.part[((size_t) s * T + k) * H_ROWS + row] = acc;
+                }
+            }
+            asm volatile("" ::: "memory");
+            {
+                uint2 u[NQ - HQ];
+                float sc[NQ - HQ];
+#pragma unroll
+                for (int q = 0; q < NQ - HQ; ++q) {
+                    u[q] = __ldg(w2 + (q + HQ) * H_TPRD + j);
+                    sc[q] = f16(__ldg(wd + ((q + HQ) * H_TPRD + j) / 4));
+                }
+#pragma unroll 1
+                for (int k = 0; k < T; ++k) {
+                    float acc = 0.f;
+#pragma unroll
+                    for (int q = 0; q < NQ - HQ; ++q) {
+                        const int ch = (q + HQ) * H_TPRD + j;
+                        acc = fmaf(sc[q] * xd[k][ch / 4], (float) dot8i(u[q], *reinterpret_cast<const int2*>(&xq[k][ch * 8])), acc);
+                    }
+                    for (int o = 1; o < H_TPRD; o <<= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
+                    if (live && j == 0) a.part[((size_t) s * T + k) * H_ROWS + row] += acc;
+                }
+            }
+        } else {
+            const uint4* w4 = reinterpret_cast<const uint4*>(a.w_inj + (size_t) (rr - LR) * D + col0);
+#pragma unroll 1
+            for (int k = 0; k < T; ++k) {
+                float acc = 0.f;
+#pragma unroll 1
+                for (int q = 0; q < NQ; ++q) {
+                    const uint4 uq = __ldg(w4 + q * H_TPRD + j);
+                    const int ch = q * H_TPRD + j;
+                    const uint16_t* hh = reinterpret_cast<const uint16_t*>(&uq);
+                    const float4 x0 = *reinterpret_cast<const float4*>(&xs[k][ch * 8]);
+                    const float4 x1 = *reinterpret_cast<const float4*>(&xs[k][ch * 8 + 4]);
+                    acc += bf(hh[0]) * x0.x + bf(hh[1]) * x0.y + bf(hh[2]) * x0.z + bf(hh[3]) * x0.w + bf(hh[4]) * x1.x +
+                           bf(hh[5]) * x1.y + bf(hh[6]) * x1.z + bf(hh[7]) * x1.w;
+                }
+                for (int o = 1; o < H_TPRD; o <<= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
+                if (live && j == 0) a.part[((size_t) s * T + k) * H_ROWS + row] = acc;
+            }
+        }
+    }
+}
+
+template <int T>
+__global__ void __launch_bounds__(256) k_hc_reduce(HcArgs a) {
+    constexpr int ITEMS = T * (LR / 32) + T;
+    const int t = threadIdx.x, warp = t >> 5, lane = t & 31;
+    const int it = blockIdx.x * (256 / 32) + warp;
+    if (it >= ITEMS) return;
+    const bool inj_item = it >= T * (LR / 32);
+    const int k = inj_item ? it - T * (LR / 32) : it / (LR / 32);
+    const bool active = !inj_item || (a.w_inj && lane < HC);
+    const int r = !active ? 0 : inj_item ? LR + lane : (it % (LR / 32)) * 32 + lane;
+    float pv[H_NS];
+#pragma unroll
+    for (int q = 0; q < H_NS; ++q) pv[q] = a.part[((size_t) q * T + k) * H_ROWS + r];
+    float sum = 0.f;
+#pragma unroll
+    for (int cc = 0; cc < HC; ++cc) {
+        float p = 0.f;
+#pragma unroll
+        for (int ss = 0; ss < H_SPS; ++ss) p += pv[cc * H_SPS + ss];
+        sum = fmaf(rs_of(a, k, cc), p, sum);
+    }
+    if (inj_item) {
+        if (active) a.inject[k * HC + lane] = sum;
+    } else q8_block(silu_(sum / (float) HC), a.loq + k * LR + (r & ~31), a.lod + k * (LR / 32) + r / 32);
+}
+
+constexpr int H_UPT = H_UPC * H_TPRU;
+template <int T>
+__global__ void __launch_bounds__(H_UPT, 2) k_hc_up(HcArgs a) {
+    __shared__ HcUp<T> up;
+    auto& lq = up.lq;
+    auto& ld = up.ld;
+    auto& rs = up.rs;
+    auto& ms = up.ms;
+    auto& gs = up.gs;
+    const int t = threadIdx.x, warp = t >> 5, lane = t & 31;
+    const int b = blockIdx.x;
+    const int uj = t % H_TPRU, udd = t / H_TPRU;
+    const bool ulive = uj < H_UB;
+    if (t < T * HC) rs[t / HC][t % HC] = rs_of(a, t / HC, t % HC);
+    for (int e = t; e < T * LR / 4; e += H_UPT) reinterpret_cast<int*>(&lq[0][0])[e] = reinterpret_cast<const int*>(a.loq)[e];
+    for (int e = t; e < T * (LR / 32); e += H_UPT) ld[e / (LR / 32)][e % (LR / 32)] = a.lod[e];
+    uint4 wq[HC][2] = {};
+    uint16_t wsh[HC] = {};
+    if (ulive) {
+#pragma unroll
+        for (int cc = 0; cc < HC; ++cc) {
+            const size_t urow = (size_t) cc * N + b * H_UPC + udd;
+            const uint4* wp = reinterpret_cast<const uint4*>(a.w_up.q + urow * LR + uj * 32);
+            wq[cc][0] = __ldg(wp);
+            wq[cc][1] = __ldg(wp + 1);
+            wsh[cc] = __ldg(a.w_up.d + urow * (LR / 32) + uj);
+        }
+    }
+    __syncthreads();
+    float wsc[HC];
+#pragma unroll
+    for (int cc = 0; cc < HC; ++cc) wsc[cc] = ulive ? f16(wsh[cc]) : 0.f;
+#pragma unroll 1
+    for (int k = 0; k < T; ++k) {
+        const int4* xp = reinterpret_cast<const int4*>(&lq[k][(ulive ? uj : 0) * 32]);
+        const int4 x0 = xp[0], x1 = xp[1];
+        const float dl = ld[k][ulive ? uj : 0];
+        float acc[HC];
+#pragma unroll
+        for (int cc = 0; cc < HC; ++cc) {
+            const uint4 w0 = wq[cc][0], w1 = wq[cc][1];
+            int sacc = __dp4a((int) w0.x, x0.x, 0);
+            sacc = __dp4a((int) w0.y, x0.y, sacc);
+            sacc = __dp4a((int) w0.z, x0.z, sacc);
+            sacc = __dp4a((int) w0.w, x0.w, sacc);
+            sacc = __dp4a((int) w1.x, x1.x, sacc);
+            sacc = __dp4a((int) w1.y, x1.y, sacc);
+            sacc = __dp4a((int) w1.z, x1.z, sacc);
+            sacc = __dp4a((int) w1.w, x1.w, sacc);
+            acc[cc] = wsc[cc] * dl * (float) sacc;
+        }
+#pragma unroll
+        for (int cc = 0; cc < HC; ++cc) {
+#pragma unroll
+            for (int o = 1; o < H_TPRU; o <<= 1) acc[cc] += __shfl_xor_sync(0xffffffffu, acc[cc], o);
+            if (uj == 0) gs[k][cc][udd] = acc[cc];
+        }
+    }
+    __syncthreads();
+    for (int e = t; e < T * HC * H_UPC; e += H_UPT) {
+        const int col = e % H_UPC, cc = (e / H_UPC) % HC, k = e / (H_UPC * HC), dc = b * H_UPC + col;
+        const float rv = rprime(a, k, cc, dc);
+        if (a.bo) a.R[(size_t) k * D + cc * N + dc] = rv;
+        gs[k][cc][col] = sigm(gs[k][cc][col]) * (rv * a.w_norm[cc * N + dc] * rs[k][cc]);
+    }
+    __syncthreads();
+    for (int e = t; e < T * H_UPC; e += H_UPT) {
+        const int col = e % H_UPC, k = e / H_UPC;
+        const float sum = (gs[k][0][col] + gs[k][1][col] + gs[k][2][col] + gs[k][3][col]) / (float) HC;
+        a.mixed[(size_t) k * N + b * H_UPC + col] = sum;
+        ms[k][col] = sum;
+    }
+    if (!a.q8) return;
+    __syncthreads();
+    if (warp < T) {
+        const float xi = ms[warp][lane];
+        const float amax = wmax(fabsf(xi)), sm = wsum(xi);
+        const float dq = amax / 127.0f;
+        block_q8_1& yq = a.q8[(size_t) warp * (N / 32) + b];
+        const int8_t qv = amax == 0.0f ? 0 : (int8_t) roundf(xi / dq);
+        yq.qs[lane] = qv;
+        if (lane == 0) yq.ds = make_half2(__float2half(dq), __float2half(sm));
+        if (a.tq) {
+            a.tq[(size_t) warp * N + b * 32 + lane] = qv;
+            if (lane == 0) a.td[(size_t) warp * (N / 32) + b] = __half2float(__float2half(dq));
+        }
+    }
+}
+
 // one: k_hc's one-barrier form (built for windows of up to 8 rows); grid: the card's, from hc_prepare
 template <int T> void hc_launch(const HcArgs& a, cudaStream_t st, bool one, int grid) {
+    static const bool use_split = env_int("FNX_HC_SPLIT", 0) != 0;
+    if (use_split) {
+        k_hc_down<T><<<H_BLOCKS_D, H_DT_D, 0, st>>>(a);
+        constexpr int ITEMS = T * (LR / 32) + T;
+        k_hc_reduce<T><<<(ITEMS + 7) / 8, 256, 0, st>>>(a);
+        k_hc_up<T><<<H_BLOCKS, H_UPT, 0, st>>>(a);
+        return;
+    }
     if constexpr (T <= 8) {
         if (one) {
             if (grid < H_BLOCKS) k_hc<T, true, true><<<grid, H_DT, 0, st>>>(a);

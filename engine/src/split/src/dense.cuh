@@ -45,7 +45,7 @@ __device__ __forceinline__ void q8s_block(const Q8Segs& g, int rows, int cols, c
     for (int r = 0; r < Q8S_R; ++r)
 #pragma unroll
         for (int t = 0; t < T; ++t) acc[r][t] = 0.f;
-    if constexpr ((T > 8 && Q8S_R >= 2) || (Q8S_R >= 4 && T > 4)) {
+    if constexpr (T > 4 && Q8S_R >= 2) {
         // the step's weights for the warp's rows held, the activations TC rows at a time against them: all T rows'
         // held took up to ~160 registers (16 rows, 4 a warp: one block an SM, 12% occupancy). kbench, 16 rows: the
         // head 722 -> 495 us, qkvz 60 -> 48; at 5-8 rows it pays only with 4 rows a warp, and not at all with 1. Each

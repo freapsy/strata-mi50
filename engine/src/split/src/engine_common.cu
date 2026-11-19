@@ -817,10 +817,19 @@ std::vector<int> Engine::verify(const std::vector<int>& tokens) {
         ck(cudaMemcpyAsync(&h_.err[c], err_word(b), 4, cudaMemcpyDeviceToHost, b.st), "window err");
         ck(cudaEventRecord(b.ev1, b.st), "event");
     };
-    if (dump) {
+    bool do_prof = false;
+    if (!dump && !warming_) {
+        static const int st_mode = (int) env_int("FNX_STAGE_TIME", 0);
+        static unsigned prof_seen = 0;
+        if (st_mode >= 2 && T >= 1 && T <= 16 && !(prof_seen & (1u << T))) {
+            prof_seen |= (1u << T);
+            do_prof = true;
+        }
+    }
+    if (dump || do_prof) {
         each(upload);
-        dump_dev("R0", -1, cb_[0]->R, T, ROW_W);
-        enqueue(T, true);
+        if (dump) dump_dev("R0", -1, cb_[0]->R, T, ROW_W);
+        enqueue(T, (bool) dump, do_prof);
         each(download);
     } else {
         const std::vector<int> key = graph_key({cur_});

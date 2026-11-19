@@ -110,8 +110,8 @@ void check_cards() {
         // compute capability. Any other card would find no kernels
         {
             bool built = false;
-            for (const char* a : {"gfx1201", "gfx1200", "gfx1100", "gfx1101", "gfx1102", "gfx1103"})
-                if (std::strncmp(prop.gcnArchName, a, 7) == 0) built = true;
+            for (const char* a : {"gfx906", "gfx1201", "gfx1200", "gfx1100", "gfx1101", "gfx1102", "gfx1103"})
+                if (std::strncmp(prop.gcnArchName, a, std::strlen(a)) == 0) built = true;
             if (!built)
                 throw std::runtime_error("card " + std::to_string(dev) + " (" + prop.name + ") is " + prop.gcnArchName +
                                          " and this build has kernels for gfx1201, gfx1200 and gfx1100..gfx1103 only");

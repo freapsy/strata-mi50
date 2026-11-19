@@ -701,41 +701,53 @@ __global__ void __launch_bounds__(HD) k_att_merge_a2a(AttRing r, const float* qg
     const unsigned tag = *tagp * 256u + (unsigned) call + 1u;
     const int g = r.card, i = threadIdx.x, hl = blockIdx.x, t = blockIdx.y;
     constexpr int W = HD + 2;
-    const size_t slot_sz = (size_t) ATT_ROWS * ATT_OWN * W, set_sz = (NCARD - 1) * slot_sz;
-    auto slot_of = [&](int sender, int owner) { return ((sender - owner - 1) % NCARD + NCARD) % NCARD; };   // 0 .. NCARD - 2 for sender != owner
-    auto word = [&](unsigned long long* b, int step, int k) { return b + step * slot_sz + ((size_t) t * ATT_OWN + hl) * W + k; };
+    // Each original u64 slot has 2*W u32 words: [0..W-1] = plain 4-byte floats (50% PCIe bytes!), [W] = u32 block flag
+    const size_t slot_sz_u32 = (size_t) ATT_ROWS * ATT_OWN * W * 2, set_sz_u32 = (NCARD - 1) * slot_sz_u32;
+    auto slot_of = [&](int sender, int owner) { return ((sender - owner - 1) % NCARD + NCARD) % NCARD; };
+    auto base_of = [&](unsigned* b, int step) { return b + step * slot_sz_u32 + ((size_t) t * ATT_OWN + hl) * (W * 2); };
     auto mine = [&](int chunk, int k) { return part[((size_t) t * NQH + chunk * ATT_OWN + hl) * W + k]; };
-    auto put = [&](unsigned long long* p, float v) {
-        *(volatile unsigned long long*) p = (unsigned long long) __float_as_uint(v) | ((unsigned long long) tag << 32);
-    };
-    auto take = [&](const unsigned long long* p) {
-        const long long t0 = clock64();
-        unsigned long long w;
-        for (;;) {
-            w = *(const volatile unsigned long long*) p;
-            if ((unsigned) (w >> 32) == tag) break;
-            if (clock64() - t0 > 4000000000LL) { atomicOr(r.err, 1u); break; }
-        }
-        return __uint_as_float((unsigned) w);
-    };
-    for (int c = 0; c < NCARD; ++c) {   // push my partial of every other card's chunk to its owner
+    for (int c = 0; c < NCARD; ++c) {
         if (c == g) continue;
-        unsigned long long* in_c = (unsigned long long*) r.peer_in[c] + (tag & 1) * set_sz;
-        const int sl = slot_of(g, c);
-        put(word(in_c, sl, i), mine(c, i));
+        unsigned* p = base_of((unsigned*) r.peer_in[c] + (tag & 1) * set_sz_u32, slot_of(g, c));
+        *(volatile unsigned*) (p + i) = __float_as_uint(mine(c, i));
         if (i == 0) {
-            put(word(in_c, sl, HD), mine(c, HD));
-            put(word(in_c, sl, HD + 1), mine(c, HD + 1));
+            *(volatile unsigned*) (p + HD) = __float_as_uint(mine(c, HD));
+            *(volatile unsigned*) (p + HD + 1) = __float_as_uint(mine(c, HD + 1));
         }
     }
-    unsigned long long* in = (unsigned long long*) r.in + (tag & 1) * set_sz;
+    __syncthreads();
+    if (i == 0) {
+        __threadfence_system();
+        for (int c = 0; c < NCARD; ++c) {
+            if (c == g) continue;
+            unsigned* p = base_of((unsigned*) r.peer_in[c] + (tag & 1) * set_sz_u32, slot_of(g, c));
+            *(volatile unsigned*) (p + W) = tag;
+        }
+        unsigned* in = (unsigned*) r.in + (tag & 1) * set_sz_u32;
+        const long long t0 = clock64();
+        for (int src = 0; src < NCARD; ++src) {
+            if (src == g) continue;
+            const volatile unsigned* fp = base_of(in, slot_of(src, g)) + W;
+            while (*fp != tag) {
+                if (*(volatile const unsigned*) r.err & 1u) break;
+                if (clock64() - t0 > 4000000000LL) { atomicOr(r.err, 1u); break; }
+#if FNX_HIP
+                __builtin_amdgcn_s_sleep(1);
+#endif
+            }
+        }
+    }
+    __syncthreads();
+    unsigned* in = (unsigned*) r.in + (tag & 1) * set_sz_u32;
     float m = 0.f, z = 0.f, a = 0.f;
-    for (int src = 0; src < NCARD; ++src) {   // merge in card order: the same on whichever card owns the chunk
+    for (int src = 0; src < NCARD; ++src) {
         float m2, z2, a2;
         if (src == g) m2 = mine(g, HD), z2 = mine(g, HD + 1), a2 = mine(g, i);
         else {
-            const int sl = slot_of(src, g);
-            m2 = take(word(in, sl, HD)), z2 = take(word(in, sl, HD + 1)), a2 = take(word(in, sl, i));
+            const volatile unsigned* p = base_of(in, slot_of(src, g));
+            m2 = __uint_as_float(p[HD]);
+            z2 = __uint_as_float(p[HD + 1]);
+            a2 = __uint_as_float(p[i]);
         }
         if (src == 0) m = m2, z = z2, a = a2;
         else att_merge(m, z, a, m2, z2, a2);
@@ -852,6 +864,7 @@ __device__ __forceinline__ void rput(unsigned long long* p, float2 v, unsigned t
     const __half2 h = __floats2half2_rn(v.x, v.y);
     *(volatile unsigned long long*) p = (unsigned long long) *reinterpret_cast<const unsigned*>(&h) | ((unsigned long long) tag << 32);
 }
+template <int SLEEP = 0>
 __device__ __forceinline__ float2 rtake(const unsigned long long* p, unsigned tag, unsigned* err) {
     const long long t0 = clock64();
     unsigned long long w;
@@ -859,6 +872,9 @@ __device__ __forceinline__ float2 rtake(const unsigned long long* p, unsigned ta
         w = *(const volatile unsigned long long*) p;
         if ((unsigned) (w >> 32) == tag) break;
         if (clock64() - t0 > 4000000000LL) { atomicOr(err, 1u); break; }
+#if FNX_HIP
+        if constexpr (SLEEP > 0) __builtin_amdgcn_s_sleep(SLEEP);
+#endif
     }
     const unsigned lo = (unsigned) w;
     return __half22float2(*reinterpret_cast<const __half2*>(&lo));
@@ -946,6 +962,146 @@ __global__ void k_ring(Ring r, float* x, int T, const unsigned* tagp, int call, 
 // NCARD - 1 in fp32 (its own addend rounded to fp16 first, as the others see it): every card gets the same sum, with one fp16 rounding per addend
 // instead of the ring's NCARD - 1. A tagged word is its own valid flag, so there is no fence and no flag write; 2 (NCARD - 1) hops of a cross-card
 // round trip (13-20 us each on HIP) become one.
+// Hybrid packed one-hop host exchange (FNX_RING_PACK):
+// - T <= 4: 16-byte u32x4 octets (4 half2 = 8 FP16s/thread, 2-5 blocks, lowest latency for Prose!)
+// - T >= 5: 8-byte u64 quads (2 half2 = 4 FP16s/thread, 13-18 blocks, highest PCIe parallelism for Code!)
+// Both keep own values in registers (zero self-read over OCuLink!) and use 1 flag/block with s_sleep(1).
+typedef unsigned fnx_u32x4 __attribute__((ext_vector_type(4)));
+__global__ void k_ring_a2a_pack16(Ring r, float* x, int T, const unsigned* tagp, int call, RingMoe m) {
+    const unsigned tag = *tagp * 256u + (unsigned) call + 1u;
+    const int g = r.card;
+    const int total_o = (T * NP) >> 2;
+    const int o = blockIdx.x * blockDim.x + threadIdx.x;
+    const size_t set_sz_u64 = (size_t) MAXT * NP;
+    const size_t base_off_u64 = (size_t) (tag & 1) * set_sz_u64;
+    const size_t flag_idx = set_sz_u64 - 64 + blockIdx.x;
+    unsigned long long* mine64 = (unsigned long long*) r.in + base_off_u64;
+    fnx_u32x4* mine16 = reinterpret_cast<fnx_u32x4*>(mine64);
+    __half2 mh[4] = {};
+    if (o < total_o) {
+        const int e0 = o * 4;
+        fnx_u32x4 v16;
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            const int e = e0 + k;
+            const float2 v = ring_x2(x, m, T, e / NP, e % NP);
+            if (!(fabsf(v.x) <= RING_MAX && fabsf(v.y) <= RING_MAX)) atomicOr(r.err, 2u);
+            mh[k] = __floats2half2_rn(v.x, v.y);
+            v16[k] = *reinterpret_cast<const unsigned*>(&mh[k]);
+        }
+        *(volatile fnx_u32x4*) (mine16 + o) = v16;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        __threadfence_system();
+        *(volatile unsigned long long*) (mine64 + flag_idx) = (unsigned long long) tag;
+        const long long t0 = clock64();
+#pragma unroll
+        for (int src = 0; src < NCARD; ++src) {
+            if (src == g) continue;
+            const volatile unsigned long long* fp = (const volatile unsigned long long*) r.peer_in[src] + base_off_u64 + flag_idx;
+            while (*fp != (unsigned long long) tag) {
+                if (*(volatile const unsigned*) r.err & 1u) break;
+                if (clock64() - t0 > 4000000000LL) { atomicOr(r.err, 1u); break; }
+#if FNX_HIP
+                __builtin_amdgcn_s_sleep(1);
+#endif
+            }
+        }
+    }
+    __syncthreads();
+    if (o >= total_o || (*(volatile const unsigned*) r.err & 1u)) return;
+    float2 s[4] = {};
+#pragma unroll
+    for (int src = 0; src < NCARD; ++src) {
+        if (src == g) {
+#pragma unroll
+            for (int k = 0; k < 4; ++k) {
+                const float2 w = __half22float2(mh[k]);
+                s[k] = src == 0 ? w : add2(s[k], w);
+            }
+        } else {
+            const fnx_u32x4 v16 = *(const volatile fnx_u32x4*) (reinterpret_cast<const fnx_u32x4*>((const unsigned long long*) r.peer_in[src] + base_off_u64) + o);
+#pragma unroll
+            for (int k = 0; k < 4; ++k) {
+                const unsigned uk = v16[k];
+                const float2 w = __half22float2(*reinterpret_cast<const __half2*>(&uk));
+                s[k] = src == 0 ? w : add2(s[k], w);
+            }
+        }
+    }
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        x[8 * o + 2 * k + 0] = s[k].x;
+        x[8 * o + 2 * k + 1] = s[k].y;
+    }
+}
+
+__global__ void k_ring_a2a_pack(Ring r, float* x, int T, const unsigned* tagp, int call, RingMoe m) {
+    const unsigned tag = *tagp * 256u + (unsigned) call + 1u;
+    const int g = r.card;
+    const int total_q = (T * NP) >> 1;
+    const int q = blockIdx.x * blockDim.x + threadIdx.x;
+    const size_t set_sz = (size_t) MAXT * NP;
+    const size_t base_off = (size_t) (tag & 1) * set_sz;
+    const size_t flag_idx = set_sz - 64 + blockIdx.x;
+    unsigned long long* mine = (unsigned long long*) r.in + base_off;
+    __half2 my_h0 = {}, my_h1 = {};
+    if (q < total_q) {
+        const int e0 = q * 2, e1 = e0 + 1;
+        const float2 v0 = ring_x2(x, m, T, e0 / NP, e0 % NP);
+        const float2 v1 = ring_x2(x, m, T, e1 / NP, e1 % NP);
+        if (!(fabsf(v0.x) <= RING_MAX && fabsf(v0.y) <= RING_MAX && fabsf(v1.x) <= RING_MAX && fabsf(v1.y) <= RING_MAX))
+            atomicOr(r.err, 2u);
+        my_h0 = __floats2half2_rn(v0.x, v0.y);
+        my_h1 = __floats2half2_rn(v1.x, v1.y);
+        const unsigned u0 = *reinterpret_cast<const unsigned*>(&my_h0);
+        const unsigned u1 = *reinterpret_cast<const unsigned*>(&my_h1);
+        *(volatile unsigned long long*) (mine + q) = (unsigned long long) u0 | ((unsigned long long) u1 << 32);
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        __threadfence_system();
+        *(volatile unsigned long long*) (mine + flag_idx) = (unsigned long long) tag;
+        const long long t0 = clock64();
+#pragma unroll
+        for (int src = 0; src < NCARD; ++src) {
+            if (src == g) continue;
+            const volatile unsigned long long* fp = (const volatile unsigned long long*) r.peer_in[src] + base_off + flag_idx;
+            while (*fp != (unsigned long long) tag) {
+                if (*(volatile const unsigned*) r.err & 1u) break;
+                if (clock64() - t0 > 4000000000LL) { atomicOr(r.err, 1u); break; }
+#if FNX_HIP
+                __builtin_amdgcn_s_sleep(1);
+#endif
+            }
+        }
+    }
+    __syncthreads();
+    if (q >= total_q || (*(volatile const unsigned*) r.err & 1u)) return;
+    float2 s0 = make_float2(0.f, 0.f), s1 = make_float2(0.f, 0.f);
+#pragma unroll
+    for (int src = 0; src < NCARD; ++src) {
+        float2 w0, w1;
+        if (src == g) {
+            w0 = __half22float2(my_h0);
+            w1 = __half22float2(my_h1);
+        } else {
+            const unsigned long long w = *(const volatile unsigned long long*) ((const unsigned long long*) r.peer_in[src] + base_off + q);
+            const unsigned u0 = (unsigned) w, u1 = (unsigned) (w >> 32);
+            w0 = __half22float2(*reinterpret_cast<const __half2*>(&u0));
+            w1 = __half22float2(*reinterpret_cast<const __half2*>(&u1));
+        }
+        s0 = src == 0 ? w0 : add2(s0, w0);
+        s1 = src == 0 ? w1 : add2(s1, w1);
+    }
+    x[4 * q + 0] = s0.x;
+    x[4 * q + 1] = s0.y;
+    x[4 * q + 2] = s1.x;
+    x[4 * q + 3] = s1.y;
+}
+
+template <int SLEEP = 0>
 __global__ void k_ring_a2a(Ring r, float* x, int T, const unsigned* tagp, int call, RingMoe m) {
     const unsigned tag = *tagp * 256u + (unsigned) call + 1u;
     const int g = r.card, n = gridDim.x * blockDim.x, tid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -962,7 +1118,7 @@ __global__ void k_ring_a2a(Ring r, float* x, int T, const unsigned* tagp, int ca
         float2 sum = make_float2(0.f, 0.f);
 #pragma unroll
         for (int src = 0; src < NCARD; ++src) {
-            const float2 w = src == g ? __half22float2(h) : rtake((const unsigned long long*) r.peer_in[src] + (tag & 1) * set_sz + e, tag, r.err);
+            const float2 w = src == g ? __half22float2(h) : rtake<SLEEP>((const unsigned long long*) r.peer_in[src] + (tag & 1) * set_sz + e, tag, r.err);
             sum = src == 0 ? w : add2(sum, w);
         }
         x[2 * e] = sum.x;
@@ -1605,7 +1761,30 @@ void ring_sum(const Ring& r, float* x, int T, const unsigned* tag, int call, voi
         return;
     }
     if (r.onehop && T <= MAXT) {
-        k_ring_a2a<<<grid, 256, 0, (cudaStream_t) st>>>(r, x, T, tag, call, m);
+        static const int rpack = (int) env_int("FNX_RING_PACK", 0);
+        if (rpack > 0 && (NP & 3) == 0) {
+            if (T <= 4) {
+                const int total_o = (T * NP) >> 2;
+                const int rgrid = (total_o + 255) / 256;
+                if (rgrid <= 64) {
+                    k_ring_a2a_pack16<<<rgrid, 256, 0, (cudaStream_t) st>>>(r, x, T, tag, call, m);
+                    ck_launch("ring_sum (one hop packed 16B)");
+                    return;
+                }
+            } else {
+                const int total_q = (T * NP) >> 1;
+                const int rgrid = (total_q + 255) / 256;
+                if (rgrid <= 64) {
+                    k_ring_a2a_pack<<<rgrid, 256, 0, (cudaStream_t) st>>>(r, x, T, tag, call, m);
+                    ck_launch("ring_sum (one hop packed 8B)");
+                    return;
+                }
+            }
+        }
+        static const int rsleep = (int) env_int("FNX_RING_SLEEP", 0);
+        if (rsleep >= 2) k_ring_a2a<2><<<grid, 256, 0, (cudaStream_t) st>>>(r, x, T, tag, call, m);
+        else if (rsleep == 1) k_ring_a2a<1><<<grid, 256, 0, (cudaStream_t) st>>>(r, x, T, tag, call, m);
+        else k_ring_a2a<0><<<grid, 256, 0, (cudaStream_t) st>>>(r, x, T, tag, call, m);
         ck_launch("ring_sum (one hop)");
         return;
     }

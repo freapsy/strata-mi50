@@ -4,11 +4,17 @@
 #include <hip/hip_runtime.h>
 #include <cuda_runtime.h>   // the tree's shim (include/strata/hip_compat): its names are redefined below, so it must come first
 
+#undef cudaDeviceGetPCIBusId
 #define cudaDeviceGetPCIBusId hipDeviceGetPCIBusId
+#undef cudaPointerAttributes
 #define cudaPointerAttributes hipPointerAttribute_t
+#undef cudaPointerGetAttributes
 #define cudaPointerGetAttributes hipPointerGetAttributes
+#undef cudaGetErrorName
 #define cudaGetErrorName hipGetErrorName
+#undef cudaStreamCaptureModeRelaxed
 #define cudaStreamCaptureModeRelaxed hipStreamCaptureModeRelaxed
+#undef cudaMemcpyHostToHost
 #define cudaMemcpyHostToHost hipMemcpyHostToHost
 #define cudaGraphExecUpdateResultInfo fnx_graph_update_info
 struct fnx_graph_update_info {
@@ -20,8 +26,32 @@ inline hipError_t cudaGraphExecUpdate(hipGraphExec_t exec, hipGraph_t g, fnx_gra
 }
 
 // cuBLAS: the f16 products with tensor-op math are hipBLAS's default on a gfx12 card
+
+#include <cublas_v2.h>
+#ifndef cublasSgemm
+#define cublasSgemm hipblasSgemm
+#endif
+#ifndef cublasHgemm
+#define cublasHgemm hipblasHgemm
+#endif
+#ifndef cublasGemmEx
+#define cublasGemmEx hipblasGemmEx
+#endif
+#ifndef cublasGemmStridedBatchedEx
+#define cublasGemmStridedBatchedEx hipblasGemmStridedBatchedEx
+#endif
+#ifndef cublasSgemmStridedBatched
+#define cublasSgemmStridedBatched hipblasSgemmStridedBatched
+#endif
+#ifndef cublasSetMathMode
+#define cublasSetMathMode hipblasSetMathMode
+#endif
+
+#undef CUBLAS_COMPUTE_16F
 #define CUBLAS_COMPUTE_16F HIPBLAS_COMPUTE_16F
+#undef CUBLAS_GEMM_DEFAULT_TENSOR_OP
 #define CUBLAS_GEMM_DEFAULT_TENSOR_OP HIPBLAS_GEMM_DEFAULT
+#undef CUBLAS_TENSOR_OP_MATH
 #define CUBLAS_TENSOR_OP_MATH HIPBLAS_DEFAULT_MATH
 
 // __ldcg: a load that skips the non-coherent caches (data another block of the same launch wrote, behind the hc read's grid barrier):
