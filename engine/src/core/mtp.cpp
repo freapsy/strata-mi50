@@ -437,13 +437,15 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
     attn_scratch_floats_ = (int64_t) strata::kernels::qsa_decode_attn_scratch_floats(cap_, s);
     const uint64_t T = (uint64_t) max_t, N = (uint64_t) g.n_embd, HC = (uint64_t) g.hc, K = (uint64_t) ss.k;
     const uint64_t NH = (uint64_t) g.n_head, HD = (uint64_t) g.head_dim, NKV = (uint64_t) g.n_head_kv;
-    const uint64_t R2 = 2 * T;   // step/pos rows: T catch-up rows + up to T-2 chain steps
+    const uint64_t C_MAX = force_on_ ? 12ull : (T > 1 ? T - 1 : 1ull);
+    const uint64_t R2 = force_on_ ? std::max<uint64_t>(2 * T, 2 * T + 8) : (2 * T);   // step/pos rows + extra chain steps
+    const uint64_t OUT_N = std::max<uint64_t>(T, C_MAX + 2);
     bool ok = mapped(T * 4 + 64, (void**) &h_tok_, (void**) &m_tok_) &&
               mapped(R2 * 4 * 4 + 64, (void**) &h_step_, (void**) &m_step_) &&
               mapped(R2 * NH * 4 + 64, (void**) &h_pos_, (void**) &m_pos_) &&
               mapped(64, (void**) &h_row_, (void**) &m_row_) &&
-              mapped(T * 4 + 64, (void**) &h_out_, (void**) &m_out_) &&
-              mapped(T * 4 + 64, (void**) &h_prob_, (void**) &m_prob_) &&
+              mapped(OUT_N * 4 + 64, (void**) &h_out_, (void**) &m_out_) &&
+              mapped(OUT_N * 4 + 64, (void**) &h_prob_, (void**) &m_prob_) &&
               (!force_on_ || mapped(64, (void**) &h_force_, (void**) &m_force_));
     if (!ok) { err = "mtp: mapped staging failed"; return false; }
     if (h_force_ != nullptr) for (int j = 0; j < 16; ++j) h_force_[j] = -1;
@@ -1498,7 +1500,7 @@ bool MtpDrafter::capture_step(int j, bool coupled, std::string& err) {
     if (exec) return true;
     using namespace strata::kernels;
     const int64_t HCN = g_->hc * g_->n_embd;
-    const int row = max_t_ + j - 1;
+    const int row = j < max_t_ - 1 ? (max_t_ + j - 1) : (2 * max_t_ + (j - (max_t_ - 1)));
     g_mp.init();
     if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) { err = "mtp: begin capture"; return false; }
     const MappedCopy in[2] = {{step_ + row * 4, m_step_ + row * 4, 4},
@@ -1953,7 +1955,8 @@ bool MtpDrafter::prepare_chain(std::string& err) {
     if (!force_on_ || h_force_ == nullptr) { err = "mtp: chains need set_force_capture before load"; return false; }
     for (int T = 1; T <= max_t_; ++T)
         if (!capture_round(T, false, err)) return false;
-    for (int j = 1; j <= max_t_ - 2; ++j)
+    const int max_out = chain_max_out();
+    for (int j = 1; j < max_out; ++j)
         if (!capture_step(j, false, err)) return false;
     if (ev_chain_ == nullptr && cudaEventCreateWithFlags(&ev_chain_, cudaEventDisableTiming) != cudaSuccess) {
         err = "mtp: event creation failed";
@@ -1973,7 +1976,7 @@ bool MtpDrafter::chain_launch(int T, const int32_t* tokens, int64_t p, int a, co
     if (!decode_ready(err)) return false;   // the chain's step graphs read the 512 experts
     if (chain_live_) { err = "mtp: a chain is already in flight"; return false; }
     if (!force_on_ || ev_chain_ == nullptr) { err = "mtp: chains need prepare_chain"; return false; }
-    if (T < 1 || T > max_t_ || a < 0 || a >= T || n_out < 1 || n_out > max_t_ - 1 || n_force < 0 || n_force > n_out ||
+    if (T < 1 || T > max_t_ || a < 0 || a >= T || n_out < 1 || n_out > chain_max_out() || n_force < 0 || n_force > n_out ||
         n_force > 16) {
         err = "mtp: chain arguments out of range";
         return false;
@@ -1996,7 +1999,7 @@ bool MtpDrafter::chain_launch(int T, const int32_t* tokens, int64_t p, int a, co
     }
     put(2 * max_t_ - 1, p + a);                                      // output 0's cell
     // every step's cell, staged at once: the ones launched now and the ones chain_extend may add
-    for (int j = 1; j < max_t_ - 1; ++j) put(max_t_ + j - 1, p + a + j);
+    for (int j = 1; j < chain_max_out(); ++j) put(j < max_t_ - 1 ? (max_t_ + j - 1) : (2 * max_t_ + (j - (max_t_ - 1))), p + a + j);
     for (int j = 0; j < 16; ++j) h_force_[j] = j < n_force ? force[j] : -1;
     h_row_[0] = a;
     h_row_[1] = 0;
@@ -2026,7 +2029,7 @@ bool MtpDrafter::chain_extend(int n_out, std::string& err) {
     const OnDevice on_device(device_);
     if (chain_n_ < 1 || n_out <= chain_n_) return true;
     if (!decode_ready(err)) return false;
-    if (n_out > max_t_ - 1 || chain_early_ != chain_n_) { err = "mtp: chain arguments out of range"; return false; }
+    if (n_out > chain_max_out() || chain_early_ != chain_n_) { err = "mtp: chain arguments out of range"; return false; }
     for (int j = chain_n_; j < n_out; ++j)
         if (step_exec_[j] == nullptr) { err = "mtp: chain graphs not prepared"; return false; }
     const Clock::time_point t0 = Clock::now();
@@ -2071,7 +2074,7 @@ int MtpDrafter::chain_poll(std::string& err) {
         chain_tok_[j] = ((volatile int32_t*) h_out_)[j];
         chain_prob_[j] = ((volatile float*) h_prob_)[j];
     }
-    for (int j = chain_n_; j < 8; ++j) { chain_tok_[j] = 0; chain_prob_[j] = 0.0f; }
+    for (int j = chain_n_; j < 16; ++j) { chain_tok_[j] = 0; chain_prob_[j] = 0.0f; }
     return 1;
 }
 

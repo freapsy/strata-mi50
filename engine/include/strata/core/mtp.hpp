@@ -78,6 +78,7 @@ public:
     static bool top2_env();
     int32_t top2(int j) const { return j >= 0 && j < (int) top2_.size() ? top2_[(size_t) j] : -1; }
     int max_t() const { return max_t_; }
+    int chain_max_out() const { return force_on_ ? 12 : (max_t_ - 1); }
     uint64_t vram_bytes() const { return vram_; }
 
     /// THE PROMPT ROOM (STRATA_MTP_ROOM_MIN).  The layer's 512 routed experts (708 MB) are read by the DECODE alone:
@@ -254,12 +255,12 @@ private:
     bool capture_prefill_dev(int T, std::string& err);   ///< E-4: without the mapped staging (inputs copied on device)
     bool capture_round(int T, bool coupled, std::string& err);
     bool capture_step(int j, bool coupled, std::string& err);
-    cudaGraphExec_t step_exec_[9] = {};
+    cudaGraphExec_t step_exec_[17] = {};
     // coupled draft sampling: its own round/step graphs (the argmax ones stay as they were), the request's
     // parameters and the penalty ring (mapped staging + device copies), the split scratch, token id -> subset index
     bool setup_coupled(std::string& err);
     cudaGraphExec_t round_exec_c_[9] = {};
-    cudaGraphExec_t step_exec_c_[9] = {};
+    cudaGraphExec_t step_exec_c_[17] = {};
     bool coupled_ok_ = false, coupled_active_ = false;
     bool coupled_rec_ = false;   ///< record_forward: the full layer ends in the coupled sampler (draft coupled_j_)
     int coupled_j_ = 0;
@@ -300,10 +301,10 @@ private:
     const float* src_R_ = nullptr;
     int32_t *h_force_ = nullptr, *m_force_ = nullptr;   ///< the forced tokens (mapped), -1 = the step's own pick
     cudaEvent_t ev_chain_ = nullptr;
-    cudaEvent_t ev_step_[8] = {};                       ///< after each of the first n_early outputs
+    cudaEvent_t ev_step_[16] = {};                       ///< after each of the first n_early outputs
     int steps_seen_ = 0, chain_n_ = 0, chain_early_ = 0;
-    int32_t chain_tok_[8] = {};
-    float chain_prob_[8] = {};
+    int32_t chain_tok_[16] = {};
+    float chain_prob_[16] = {};
     int64_t n_vocab_ = 0;
     uint64_t vram_ = 0;
     cudaStream_t cs_ = nullptr;
